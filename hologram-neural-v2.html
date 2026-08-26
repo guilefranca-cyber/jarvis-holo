@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>JARVIS — Neural Face Mesh</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#02060a;}
+  #holo{position:fixed;inset:0;z-index:1;}
+  #loader{position:fixed;inset:0;z-index:2;display:flex;align-items:center;justify-content:center;color:#9fdcff;font:13px "Courier New",monospace;letter-spacing:5px;text-shadow:0 0 12px rgba(80,200,255,.7);}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+</head>
+<body>
+<div id="holo"></div>
+<div id="loader">INICIALIZANDO MALHA NEURAL…</div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+import { MeshoptSimplifier } from 'https://unpkg.com/meshoptimizer@0.20.0/meshopt_simplify.module.js';
+
+const CONFIG = {
+  preHeight: 2.3, neckCutY: -0.68, finalHeight: 2.05, centerY: 0.05,
+  cameraFov: 40, cameraZ: 3.7, modelRotationY: 0,
+  targetTriangles: 3000,
+  bgColor: 0x02060a, skinColor: 0x030b12,
+  lineColor: 0x36c6ff, lineOpacity: 0.25,
+  dotLayers: [
+    { frac: 0.35, size: 0.012, opacity: 0.55 },
+    { frac: 0.20, size: 0.020, opacity: 0.65 },
+    { frac: 0.10, size: 0.030, opacity: 0.75 }
+  ],
+  highlightSize: 0.035, highlightOpacity: 0.70,
+  sway: 0.28, swaySpeed: 0.3, floatAmp: 0.025
+};
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth,innerHeight);
+renderer.setClearColor(CONFIG.bgColor,1);
+document.getElementById('holo').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(CONFIG.cameraFov, innerWidth/innerHeight, 0.1, 100);
+camera.position.set(0, CONFIG.centerY, CONFIG.cameraZ);
+camera.lookAt(0, CONFIG.centerY, 0);
+
+const holo = new THREE.Group();
+scene.add(holo);
+
+function makeDotTexture(){
+  const s=128, c=document.createElement('canvas'); c.width=c.height=s;
+  const g=c.getContext('2d');
+  const cx=s/2;
+  const grad=g.createRadialGradient(cx,cx,0,cx,cx,cx);
+  grad.addColorStop(0.00,'rgba(255,255,255,1)');
+  grad.addColorStop(0.25,'rgba(215,245,255,0.9)');
+  grad.addColorStop(0.55,'rgba(120,220,255,0.22)');
+  grad.addColorStop(1.00,'rgba(120,220,255,0)');
+  g.fillStyle=grad; g.fillRect(0,0,s,s);
+  g.globalCompositeOperation='lighter';
+  const ray=(x1,y1,x2,y2)=>{
+    const lg=g.createLinearGradient(x1,y1,x2,y2);
+    lg.addColorStop(0,'rgba(255,255,255,0.9)'); lg.addColorStop(1,'rgba(255,255,255,0)');
+    g.strokeStyle=lg; g.lineWidth=3; g.lineCap='round';
+    g.beginPath(); g.moveTo(x1,y1); g.lineTo(x2,y2); g.stroke();
+  };
+  ray(cx,cx,cx+56,cx); ray(cx,cx,cx-56,cx); ray(cx,cx,cx,cx+56); ray(cx,cx,cx,cx-56);
+  return new THREE.CanvasTexture(c);
+}
+const dotTex = makeDotTexture();
+
+function compactGeometry(src, indices){
+  const pa=src.attributes.position, map=new Map();
+  const positions=[], out=[];
+  for(let i=0;i<indices.length;i++){ const o=indices[i]; if(!map.has(o)){map.set(o,positions.length/3);positions.push(pa.getX(o),pa.getY(o),pa.getZ(o));} out.push(map.get(o));}
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
+  g.setIndex(out); return g;
+}
+function cropAbove(src, cutY){
+  const pos=src.attributes.position, idx=src.index.array, kept=[];
+  for(let t=0;t<idx.length;t+=3){
+    const yAvg=(pos.getY(idx[t])+pos.getY(idx[t+1])+pos.getY(idx[t+2]))/3;
+    if(yAvg>=cutY) kept.push(idx[t], idx[t+1], idx[t+2]);
+  }return compactGeometry(src, kept);
+}
+function wireframeDedup(face){
+  const pos=face.attributes.position, idx=face.index.array;
+  const seen=new Set(), verts=[], cols=face.attributes.color?[]:null;
+  const key=(a,b)=>a<b?a+'_'+b:b+'_'+a;
+  for(let t=0;t<idx.length;t+=3){
+    const tri=[idx[t], idx[t+1], idx[t+2]];
+    for(let e=0;e<3;e++){ const a=tri[e], b=tri[(e+1)%3], k=key(a,b); if(!seen.has(k)){seen.add(k); verts.push(pos.getX(a),pos.getY(a), pos.getZ(a), pos.getX(b), pos.getY(b), pos.getZ(b)); if(cols && face.attributes.color) cols.push(face.attributes.color.getX(a), face.attributes.color.getY(a), face.attributes.color.getZ(a), face.attributes.color.getX(b), face.attributes.color.getY(b), face.attributes.color.getZ(b)); } }
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(verts,3));
+  if(cols && face.attributes.color) g.setAttribute('color', new THREE.Float32BufferAttribute(cols,3));
+  return g;
+}
+function collectFeatureIndices(face){
+  const pa=face.attributes.position;
+  face.computeBoundingBox();
+  const bb=face.boundingBox, H=bb.max.y-bb.min.y, yMin=bb.min.y, maxZ=bb.max.z;
+  const out=[];
+  for(let i=0;i<pa.count;i++){
+    const x=pa.getX(i), y=pa.getY(i), z=pa.getZ(i);
+    const t=(y-yMin)/H;
+    const eyeZone=t>0.50&&t<0.74&&z>0.5*maxZ&&Math.abs(x)>0.22&&Math.abs(x)<0.80;
+    const lipZone=t>0.26&&t<0.42&&z>0.55*maxZ&&Math.abs(x)<0.38;
+    if(eyeZone||lipZone) out.push(i);
+  }return out;
+}
+
+let lineMat, pulseMats=[];
+
+/* =========== FALLBACK SE GLB FALHAR (gera rede procedural imediatamente) =========== */
+function createFallbackFace(){
+  const points = [], lines = [];
+  const cx=0, cy=0.1, r=1.2;
+  for(let i=0;i<500;i++){
+    const a=Math.random()*Math.PI*2;
+    const rr=Math.random()*r*0.5+r*0.55;
+    points.push(Math.cos(a)*rr, Math.sin(a)*rr*0.75+0.6, 0.3+Math.random()*0.15);
+  }
+  for(let i=0;i<points.length;i+=3){ for(let j=i+3;j<points.length;j+=3){ if(Math.random()<0.03){ lines.push(i/3*3, j/3*3); } } }
+  const g=new THREE.BufferGeometry();
+  const ptsArr=points;
+  const lineArr=[]; for(const [a,b] of lines){ lineArr.push(ptsArr[a], ptsArr[a+1], ptsArr[a+2], ptsArr[b], ptsArr[b+1], ptsArr[b+2]); }
+  for(const [a,b] of lines) lineArr.push(ptsArr[a],ptsArr[a+1],ptsArr[a+2],ptsArr[b],ptsArr[b+1],ptsArr[b+2]);
+  g.setAttribute('position', new THREE.Float32BufferAttribute(lineArr, 3));
+  return { wire:g, dots:g };
+}
+
+async function build(){
+  const sources=['/models/LeePerrySmith.glb','https://cdn.jsdelivr.net/npm/three@0.160.0/examples/models/gltf/LeePerrySmith/LeePerrySmith.glb','https://raw.githubusercontent.com/mrdoob/three.js/r160/examples/models/gltf/LeePerrySmith/LeePerrySmith.glb','https://threejs.org/examples/models/gltf/LeePerrySmith/LeePerrySmith.glb'];
+  const loader=new GLTFLoader();
+  let gltf=null, lastErr=null;
+  for(const url of sources){ try{ gltf=await loader.loadAsync(url); console.log('[JARVIS]',url); break; }catch(e){ console.warn('[JARVIS]',url); lastErr=e; } }
+  if(!gltf){ document.getElementById('loader').textContent='ERRO: '+(lastErr?lastErr.message:'nenhuma fonte');
+    const fb = createFallbackFace();
+    lineMat = new THREE.LineBasicMaterial({color:CONFIG.lineColor,transparent:true,opacity:CONFIG.lineOpacity,blending:THREE.NormalBlending,depthWrite:false});
+    holo.add(new THREE.LineSegments(fb.wire, lineMat));
+    holo.add(new THREE.Points(fb.dots, new THREE.PointsMaterial({size:CONFIG.nodeSize,map:dotTex,color:CONFIG.nodeColor,transparent:true,opacity:CONFIG.nodeOpacity,blending:THREE.NormalBlending,depthWrite:false,sizeAttenuation:true})));
+    document.getElementById('loader').style.display='none'; return;
+  }
+
+  let geo=null; gltf.scene.traverse(o=>{ if(o.isMesh&&!geo) geo=o.geometry.clone(); });
+  if(!geo){ document.getElementById('loader').textContent='ERRO: malha'; return; }
+
+  geo.computeBoundingBox();
+  const bb=geo.boundingBox, c=new THREE.Vector3(); bb.getCenter(c);
+  const s=new THREE.Vector3(); bb.getSize(s);
+  geo.translate(-c.x,-c.y,-c.z);
+  const k=CONFIG.preHeight/Math.max(s.x,s.y,s.z); geo.scale(k,k,k);
+  geo=BufferGeometryUtils.mergeVertices(geo,1e-4);
+
+  const cropped=cropAbove(geo,CONFIG.neckCutY);
+  await MeshoptSimplifier.ready;
+  const [newIdx]=MeshoptSimplifier.simplify(new Uint32Array(cropped.index.array), new Float32Array(cropped.attributes.position.array), 3, CONFIG.targetTriangles*3, 0.9, ['LockBorder']);
+  const face=compactGeometry(cropped,newIdx);
+
+  face.computeBoundingBox();
+  const fb=face.boundingBox, fc=new THREE.Vector3(); fb.getCenter(fc);
+  const fs=new THREE.Vector3(); fb.getSize(fs);
+  const k2=CONFIG.finalHeight/fs.y; face.scale(k2,k2,k2);
+  face.computeBoundingBox(); face.boundingBox.getCenter(fc);
+  face.translate(-fc.x, -fc.y+CONFIG.centerY, -fc.z);
+  console.log('[JARVIS] vertices:', face.attributes.position.count, '| tri:', face.index.count/3);
+
+  /* Occlusor leve (evita que linhas de trás apareçam — mas sem saturar) */
+  const occluder = new THREE.Mesh(face.clone(), new THREE.MeshBasicMaterial({
+    color: 0x010a14, transparent: true, opacity: 0.35, depthWrite: false, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2
+  }));
+  holo.add(occluder);
+
+  /* Linhas */
+  lineMat=new THREE.LineBasicMaterial({color:CONFIG.lineColor, vertexColors:true, transparent:true, opacity:CONFIG.lineOpacity, blending:THREE.NormalBlending, depthWrite:false, polygonOffset:true, polygonOffsetFactor:-1, polygonOffsetUnits:-1});
+  holo.add(new THREE.LineSegments(wireframeDedup(face), lineMat));
+
+  /* Nodos: 3 camadas variáveis (não duplicado completo) */
+  const pa=face.attributes.position;
+  for(const L of CONFIG.dotLayers){
+    const pts=[], cols=[];
+    for(let i=0;i<pa.count;i++) if(Math.random()<L.frac){ pts.push(pa.getX(i),pa.getY(i),pa.getZ(i)); cols.push(0.92,0.96,1); }
+    const g=new THREE.BufferGeometry();
+    g.setAttribute('position',new THREE.Float32BufferAttribute(pts,3));
+    const m=new THREE.PointsMaterial({size:L.size,map:dotTex,vertexColors:true,color:0xffffff,transparent:true,opacity:L.opacity,blending:THREE.NormalBlending,depthWrite:false,sizeAttenuation:true});
+    pulseMats.push({mat:m,base:L.size});
+    holo.add(new THREE.Points(g,m));
+  }
+
+  /* Destaque olhos + boca */
+  const feat=collectFeatureIndices(face);
+  const fp=[], fc2=[];
+  for(const i of feat){ fp.push(pa.getX(i),pa.getY(i),pa.getZ(i)); fc2.push(0.92,0.96,1); }
+  const fg=new THREE.BufferGeometry();
+  fg.setAttribute('position',new THREE.Float32BufferAttribute(fp,3));
+  const fmat=new THREE.PointsMaterial({size:CONFIG.highlightSize,map:dotTex,vertexColors:true,color:0xeaffff,transparent:true,opacity:CONFIG.highlightOpacity,blending:THREE.NormalBlending,depthWrite:false,sizeAttenuation:true});
+  pulseMats.push({mat:fmat,base:CONFIG.highlightSize});
+  holo.add(new THREE.Points(fg,fmat));
+
+  document.getElementById('loader').style.display='none';
+}
+build().catch(err=>{ console.error(err); document.getElementById('loader').textContent='ERRO — '+err.message; });
+
+let audioLevel=0;
+window.JARVISFace={setLevel(v){audioLevel=Math.max(0,Math.min(2,v));}};
+const clock=new THREE.Clock();
+(function animate(){
+  requestAnimationFrame(animate);
+  const t=clock.getElapsedTime();
+  audioLevel*=0.9;
+  holo.rotation.y=CONFIG.modelRotationY+Math.sin(t*CONFIG.swaySpeed)*CONFIG.sway;
+  holo.rotation.x=Math.sin(t*0.22)*0.04;
+  holo.position.y=CONFIG.centerY+Math.sin(t*0.8)*CONFIG.floatAmp;
+  const breathe=1+Math.sin(t*1.4)*0.05+audioLevel*0.30;
+  for(const p of pulseMats) p.mat.size=p.base*breathe;
+  if(lineMat) lineMat.opacity=CONFIG.lineOpacity+Math.sin(t*1.1)*0.05+audioLevel*0.12;
+  renderer.render(scene,camera);
+})();
+addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+</script>
+</body>
+</html>
